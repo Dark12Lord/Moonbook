@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+uploads/
+chapters/*
+!chapters/.gitkeep
+tmp/
+*.log
