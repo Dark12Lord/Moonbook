@@ -4,7 +4,8 @@
 
 import { logError } from './logger';
 
-const BASE_URL = 'https://mangalik.net';
+const BASE_URL = 'https://lekmanga.net'; // يتجاوز الـ Captcha على mangalik.net
+const MANGA_BASE = 'https://mangalik.net';  // روابط الفصول تبقى على النطاق الأصلي
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   'Referer': BASE_URL,
@@ -126,7 +127,7 @@ export async function getMangaDetails(slug: string): Promise<MangaDetails> {
     const html = await fetchHtml(url);
 
     // ─── العنوان ──────────────────────────────────────────────
-    const titleMatch = html.match(/<h1[^>]*class="[^"]*post-title[^"]*"[^>]*>([\s\S]*?)<\/h1>/);
+    const titleMatch = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/);
     const title = titleMatch
       ? decodeHtmlEntities(titleMatch[1].replace(/<[^>]+>/g, '').trim())
       : slug;
@@ -134,7 +135,8 @@ export async function getMangaDetails(slug: string): Promise<MangaDetails> {
     // ─── الغلاف ───────────────────────────────────────────────
     const coverMatch = html.match(/class="[^"]*summary_image[^"]*"[\s\S]*?<img([^>]+)>/);
     const rawCover   = coverMatch ? extractImgSrc(`<img${coverMatch[1]}>`) : '';
-    const cover      = rawCover.replace(/\-\d+x\d+(\.\w+)$/, '$1');
+    // نزيل الـ resize suffix (-193x278) لنحصل على الصورة الكاملة
+    const cover = rawCover.replace(/-\d+x\d+(\.\w+)$/, '$1');
 
     // ─── الوصف ────────────────────────────────────────────────
     const descMatch = html.match(/class="[^"]*summary__content[^"]*"[^>]*>([\s\S]*?)<\/div>/);
@@ -143,7 +145,7 @@ export async function getMangaDetails(slug: string): Promise<MangaDetails> {
       : '';
 
     // ─── الحالة ───────────────────────────────────────────────
-    const statusMatch = html.match(/class="[^"]*post-status[^"]*"[\s\S]*?<div[^>]*class="[^"]*summary-content[^"]*"[^>]*>([\s\S]*?)<\/div>/);
+    const statusMatch = html.match(/class="[^"]*post-status[^"]*"[\s\S]*?class="[^"]*summary-content[^"]*"[^>]*>([\s\S]*?)<\/div>/);
     const status = statusMatch
       ? statusMatch[1].replace(/<[^>]+>/g, '').trim()
       : 'غير معروف';
@@ -152,48 +154,33 @@ export async function getMangaDetails(slug: string): Promise<MangaDetails> {
     const genreMatch = html.match(/class="[^"]*genres-content[^"]*"[^>]*>([\s\S]*?)<\/div>/);
     const genres: string[] = [];
     if (genreMatch) {
-      const genreLinks = genreMatch[1].matchAll(/<a[^>]*>([^<]+)<\/a>/g);
-      for (const g of genreLinks) genres.push(g[1].trim());
-    }
-
-    // ─── manga post ID لطلب الـ AJAX ─────────────────────────
-    const postIdMatch = html.match(/manga_id['":\s]+(\d+)/);
-    const postId = postIdMatch?.[1] || '';
-
-    // ─── الفصول عبر Madara AJAX endpoint ─────────────────────
-    const chapters: ChapterEntry[] = [];
-
-    if (postId) {
-      const ajaxRes = await fetch(`${BASE_URL}/wp-admin/admin-ajax.php`, {
-        method: 'POST',
-        headers: {
-          ...HEADERS,
-          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-          'X-Requested-With': 'XMLHttpRequest',
-        },
-        body: new URLSearchParams({
-          action: 'manga_get_chapters',
-          manga: postId,
-        }).toString(),
-        signal: AbortSignal.timeout(15_000),
-      });
-
-      if (ajaxRes.ok) {
-        const chapHtml = await ajaxRes.text();
-        const chapterRegex = /<li[^>]+class="[^"]*wp-manga-chapter[^"]*"[^>]*>[\s\S]*?<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/g;
-        let chapMatch: RegExpExecArray | null;
-
-        while ((chapMatch = chapterRegex.exec(chapHtml)) !== null) {
-          const chapUrl   = chapMatch[1].trim();
-          const chapLabel = decodeHtmlEntities(chapMatch[2].replace(/<[^>]+>/g, '').trim());
-          const numMatch  = chapUrl.match(/\/(\d+(?:[-.]\d+)?)\/?$/);
-          const number    = numMatch ? numMatch[1].replace('-', '.') : chapLabel;
-          chapters.push({ number, label: chapLabel || `الفصل ${number}`, url: chapUrl });
-        }
+      for (const g of genreMatch[1].matchAll(/<a[^>]*>([^<]+)<\/a>/g)) {
+        genres.push(g[1].trim());
       }
     }
 
-    // Madara يعرض الفصول من الأحدث للأقدم — نعكس
+    // ─── الفصول — موجودة مباشرة في الـ HTML ─────────────────
+    // البنية: <li class="...wp-manga-chapter..."><a href="URL">العنوان</a>
+    const chapters: ChapterEntry[] = [];
+    const chapterRegex = /<li[^>]*wp-manga-chapter[^>]*>[\s\S]*?<a[^>]+href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/g;
+    let chapMatch: RegExpExecArray | null;
+
+    while ((chapMatch = chapterRegex.exec(html)) !== null) {
+      const chapUrl   = chapMatch[1].trim();
+      const chapLabel = decodeHtmlEntities(chapMatch[2].replace(/<[^>]+>/g, '').trim());
+      const numMatch  = chapUrl.match(/\/(\d+(?:[.-]\d+)?)\/?$/);
+      const number    = numMatch ? numMatch[1].replace('-', '.') : chapLabel;
+
+      if (chapUrl && chapLabel) {
+        chapters.push({
+          number,
+          label: chapLabel || `الفصل ${number}`,
+          url: chapUrl,
+        });
+      }
+    }
+
+    // Madara يعرضها من الأحدث للأقدم — نعكس للترتيب الصحيح
     chapters.reverse();
 
     return { title, slug, cover, description, status, genres, url, chapters };
@@ -206,8 +193,11 @@ export async function getMangaDetails(slug: string): Promise<MangaDetails> {
 // ─── صور الفصل ────────────────────────────────────────────────
 
 export async function getChapterPages(chapterUrl: string): Promise<ChapterPages> {
+  // روابط الفصول على mangalik.net — نستبدل بـ lekmanga.net لتجاوز الـ Captcha
+  const fetchUrl = chapterUrl.replace('mangalik.net', 'lekmanga.net');
+
   try {
-    const html = await fetchHtml(chapterUrl);
+    const html = await fetchHtml(fetchUrl);
 
     // العنوان
     const titleMatch = html.match(/<title>([^<]+)<\/title>/);
