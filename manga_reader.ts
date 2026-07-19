@@ -1,0 +1,418 @@
+// ─── manga_reader.ts ──────────────────────────────────────────
+// نظام قراءة المانهوا المسحوبة من mangalik.net
+// منفصل تماماً عن reader.ts (الذي يتعامل مع الملفات المرفوعة)
+
+import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs-extra';
+import {
+  ActionRowBuilder,
+  AttachmentBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  Client,
+  EmbedBuilder,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  TextChannel,
+  ButtonInteraction,
+  StringSelectMenuInteraction,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ModalSubmitInteraction,
+} from 'discord.js';
+
+import { buildProgressBar, SESSION_TTL_MS } from './utils';
+import { getChapterPages, getMangaDetails, ChapterEntry, MangaDetails } from './scraper';
+import { createReadingRoom, deleteReadingRoom } from './room';
+import { logRoomOpened, logRoomClosed, logError } from './logger';
+import { addPublishedManga, getPublishedManga } from './library';
+
+const CHUNK_SIZE = 25; // حد Discord للـ Select Menu
+
+// ─── Online Session ───────────────────────────────────────────
+
+interface OnlineSession {
+  sessionId: string;
+  slug: string;
+  chapterUrl: string;
+  chapterLabel: string;
+  roomChannelId: string;
+  messageId?: string;
+  pageIndex: number;
+  images: string[];        // روابط الصور من mangalik
+  cachedFiles: string[];   // ملفات محملة مؤقتاً على القرص
+  userId: string;
+  username: string;
+  openedAt: number;
+}
+
+const onlineSessions = new Map<string, OnlineSession>();
+const onlineUserSession = new Map<string, string>(); // userId → sessionId
+
+// Cleanup تلقائي
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of onlineSessions) {
+    if (now - session.openedAt > SESSION_TTL_MS) {
+      cleanupSession(session);
+      onlineSessions.delete(id);
+      onlineUserSession.delete(session.userId);
+    }
+  }
+}, 1000 * 60 * 30);
+
+async function cleanupSession(session: OnlineSession) {
+  // نمسح الملفات المؤقتة
+  for (const f of session.cachedFiles) {
+    await fs.remove(f).catch(() => {});
+  }
+}
+
+// ─── تحميل صورة من رابط ───────────────────────────────────────
+
+async function downloadImage(url: string, destDir: string): Promise<string> {
+  const ext = path.extname(new URL(url).pathname) || '.jpg';
+  const name = `${crypto.randomUUID()}${ext}`;
+  const dest = path.join(destDir, name);
+
+  const res = await fetch(url, {
+    headers: {
+      'Referer': 'https://mangalik.net/',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+    },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!res.ok) throw new Error(`فشل تحميل الصورة: HTTP ${res.status}`);
+
+  const buffer = Buffer.from(await res.arrayBuffer());
+  await fs.ensureDir(destDir);
+  await fs.writeFile(dest, buffer);
+  return dest;
+}
+
+// ─── Buttons القارئ ───────────────────────────────────────────
+
+function makeOnlineButtons(sessionId: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`omg_first:${sessionId}`)
+      .setLabel('⏮').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`omg_prev:${sessionId}`)
+      .setLabel('◀').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`omg_next:${sessionId}`)
+      .setLabel('▶').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`omg_last:${sessionId}`)
+      .setLabel('⏭').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId(`omg_goto:${sessionId}`)
+      .setLabel('🔢').setStyle(ButtonStyle.Secondary),
+  );
+}
+
+function makeCloseButton(sessionId: string): ActionRowBuilder<ButtonBuilder> {
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`omg_close:${sessionId}`)
+      .setLabel('✕ أغلق الروم')
+      .setStyle(ButtonStyle.Danger),
+  );
+}
+
+// ─── Embed القارئ ─────────────────────────────────────────────
+
+function buildOnlineEmbed(
+  session: OnlineSession,
+  imageName: string,
+): EmbedBuilder {
+  const current = session.pageIndex + 1;
+  const total   = session.images.length;
+  return new EmbedBuilder()
+    .setTitle(`📖 ${session.chapterLabel}`)
+    .setDescription(buildProgressBar(current, total))
+    .setImage(`attachment://${imageName}`)
+    .setColor(0x7c5cff)
+    .setFooter({ text: `Moonbook • ${session.slug}` });
+}
+
+// ─── إرسال/تعديل صفحة ────────────────────────────────────────
+
+async function sendOnlinePage(
+  channel: TextChannel,
+  session: OnlineSession,
+  edit?: { messageId: string },
+): Promise<string> {
+  const imageUrl = session.images[session.pageIndex];
+  const tmpDir   = path.join(process.cwd(), 'tmp', session.sessionId);
+
+  // نحمّل الصورة الحالية + الجاية مسبقاً
+  const filePath = await downloadImage(imageUrl, tmpDir);
+  session.cachedFiles.push(filePath);
+
+  // prefetch الصورة التالية في الخلفية
+  const nextUrl = session.images[session.pageIndex + 1];
+  if (nextUrl) downloadImage(nextUrl, tmpDir).then(f => session.cachedFiles.push(f)).catch(() => {});
+
+  const imageName = path.basename(filePath);
+  const embed = buildOnlineEmbed(session, imageName);
+  const file  = new AttachmentBuilder(filePath, { name: imageName });
+  const rows  = [makeOnlineButtons(session.sessionId), makeCloseButton(session.sessionId)];
+
+  if (edit) {
+    await channel.messages.edit(edit.messageId, { embeds: [embed], files: [file], components: rows });
+    return edit.messageId;
+  } else {
+    const msg = await channel.send({ embeds: [embed], files: [file], components: rows });
+    return msg.id;
+  }
+}
+
+// ─── بدء جلسة قراءة فصل ──────────────────────────────────────
+
+export async function startOnlineReading(
+  client: Client,
+  interaction: ButtonInteraction | StringSelectMenuInteraction,
+  slug: string,
+  chapterUrl: string,
+  chapterLabel: string,
+): Promise<void> {
+  // منع روم مكرر
+  const existingId = onlineUserSession.get(interaction.user.id);
+  if (existingId) {
+    const existing = onlineSessions.get(existingId);
+    if (existing?.roomChannelId) {
+      await interaction.reply({
+        content: [
+          '📖 **عندك روم قراءة مفتوح بالفعل!**',
+          '',
+          `<#${existing.roomChannelId}>`,
+          '',
+          'أغلقه أول قبل ما تفتح روم جديد.',
+        ].join('\n'),
+        ephemeral: true,
+      });
+      return;
+    }
+    onlineUserSession.delete(interaction.user.id);
+  }
+
+  await interaction.reply({ content: '⏳ جاري جلب الفصل وإنشاء روم القراءة...', ephemeral: true });
+
+  try {
+    // جلب صور الفصل
+    const { images } = await getChapterPages(chapterUrl);
+
+    const guildId = process.env.DISCORD_GUILD_ID || '';
+    const room = await createReadingRoom(
+      client, guildId,
+      interaction.user.id,
+      interaction.user.username,
+      slug,
+    );
+
+    const sessionId = crypto.randomUUID();
+    const session: OnlineSession = {
+      sessionId,
+      slug,
+      chapterUrl,
+      chapterLabel,
+      roomChannelId: room.id,
+      pageIndex: 0,
+      images,
+      cachedFiles: [],
+      userId: interaction.user.id,
+      username: interaction.user.username,
+      openedAt: Date.now(),
+    };
+
+    onlineSessions.set(sessionId, session);
+    onlineUserSession.set(interaction.user.id, sessionId);
+
+    // رسالة ترحيب
+    const welcomeEmbed = new EmbedBuilder()
+      .setTitle(`📖 ${chapterLabel}`)
+      .setDescription(
+        [`أهلاً <@${interaction.user.id}>! 👋`, '', `> 🖼️ **${images.length} صفحة**`, '', 'استخدم الأزرار للتنقل • ✕ للإغلاق'].join('\n')
+      )
+      .setColor(0x7c5cff);
+    await room.send({ embeds: [welcomeEmbed] });
+
+    // أول صفحة
+    const msgId = await sendOnlinePage(room, session);
+    session.messageId = msgId;
+    onlineSessions.set(sessionId, session);
+
+    await logRoomOpened({
+      username: interaction.user.username,
+      userId: interaction.user.id,
+      chapterTitle: chapterLabel,
+      channelName: room.name,
+    });
+
+    await interaction.editReply({
+      content: ['📖 **روم القراءة جاهز!**', '', `<#${room.id}>`, '', `استمتع بقراءة **${chapterLabel}** 🎉`].join('\n'),
+    });
+
+  } catch (err: any) {
+    await logError({ context: 'startOnlineReading', message: err.message, stack: err.stack });
+    await interaction.editReply(`❌ فشل فتح الفصل: ${err.message}`);
+  }
+}
+
+// ─── معالجة أزرار القارئ ──────────────────────────────────────
+
+export async function handleOnlineReaderButton(interaction: ButtonInteraction): Promise<void> {
+  const [action, sessionId] = interaction.customId.split(':');
+  const session = onlineSessions.get(sessionId);
+
+  if (!session) {
+    await interaction.reply({ content: '❌ الجلسة انتهت.', ephemeral: true });
+    return;
+  }
+
+  const lastIndex = session.images.length - 1;
+  const channel   = interaction.channel as TextChannel;
+
+  if (action === 'omg_close') {
+    const durationMin = Math.round((Date.now() - session.openedAt) / 60000);
+    const pagesRead   = session.pageIndex + 1;
+    onlineSessions.delete(sessionId);
+    onlineUserSession.delete(session.userId);
+    await cleanupSession(session);
+    await logRoomClosed({ username: session.username, userId: session.userId, chapterTitle: session.chapterLabel, pagesRead, durationMin });
+    await interaction.reply({ content: '🔒 تم إغلاق الروم، إلى اللقاء!', ephemeral: true });
+    setTimeout(() => deleteReadingRoom(interaction.client, session.roomChannelId), 2000);
+    return;
+  }
+
+  if (action === 'omg_goto') {
+    const modal = new ModalBuilder()
+      .setCustomId(`omg_modal:${sessionId}`)
+      .setTitle('انتقل إلى صفحة');
+    const input = new TextInputBuilder()
+      .setCustomId('page_number')
+      .setLabel(`رقم الصفحة (1 – ${session.images.length})`)
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+    modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
+    await interaction.showModal(modal);
+    return;
+  }
+
+  await interaction.deferUpdate();
+
+  if (action === 'omg_first') session.pageIndex = 0;
+  else if (action === 'omg_prev') session.pageIndex = Math.max(0, session.pageIndex - 1);
+  else if (action === 'omg_next') session.pageIndex = Math.min(lastIndex, session.pageIndex + 1);
+  else if (action === 'omg_last') session.pageIndex = lastIndex;
+
+  onlineSessions.set(sessionId, session);
+
+  try {
+    await sendOnlinePage(channel, session, { messageId: interaction.message.id });
+  } catch (err: any) {
+    await logError({ context: 'handleOnlineReaderButton', message: err.message, stack: err.stack });
+  }
+}
+
+// ─── معالجة Modal انتقال إلى صفحة ────────────────────────────
+
+export async function handleOnlineGotoModal(interaction: ModalSubmitInteraction): Promise<void> {
+  const [, sessionId] = interaction.customId.split(':');
+  const session = onlineSessions.get(sessionId);
+  if (!session) { await interaction.reply({ content: '❌ الجلسة انتهت.', ephemeral: true }); return; }
+
+  const raw = interaction.fields.getTextInputValue('page_number');
+  const pageNum = parseInt(raw, 10);
+  if (isNaN(pageNum) || pageNum < 1 || pageNum > session.images.length) {
+    await interaction.reply({ content: `❌ أدخل رقماً بين 1 و ${session.images.length}.`, ephemeral: true });
+    return;
+  }
+
+  session.pageIndex = pageNum - 1;
+  onlineSessions.set(sessionId, session);
+  await interaction.deferUpdate();
+
+  try {
+    await sendOnlinePage(interaction.channel as TextChannel, session, { messageId: interaction.message!.id });
+  } catch (err: any) {
+    await logError({ context: 'handleOnlineGotoModal', message: err.message, stack: err.stack });
+  }
+}
+
+// ─── بناء رسالة المانهوا (embed + select menus) ───────────────
+
+export async function publishMangaToChannel(
+  client: Client,
+  channel: TextChannel,
+  manga: MangaDetails,
+): Promise<string> {
+  // ─── Embed المانهوا ───────────────────────────────────────
+  const embed = new EmbedBuilder()
+    .setTitle(`📚 ${manga.title}`)
+    .setDescription(
+      [
+        manga.description || 'لا يوجد وصف.',
+        '',
+        `> 📊 **${manga.chapters.length} فصل** • ${manga.status}`,
+        manga.genres.length ? `> 🏷️ ${manga.genres.slice(0, 4).join(' • ')}` : '',
+      ].filter(Boolean).join('\n')
+    )
+    .setThumbnail(manga.cover)
+    .setColor(0x7c5cff)
+    .setFooter({ text: `Moonbook • ${manga.slug}` })
+    .setTimestamp();
+
+  // ─── Select Menus (كل 25 فصل = منيو) ────────────────────
+  const rows: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
+
+  for (let i = 0; i < manga.chapters.length && rows.length < 5; i += CHUNK_SIZE) {
+    const chunk = manga.chapters.slice(i, i + CHUNK_SIZE);
+    const first = chunk[0].number;
+    const last  = chunk[chunk.length - 1].number;
+
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId(`omg_select:${manga.slug}:${i}`)
+      .setPlaceholder(`📖 الفصول ${first} – ${last}`)
+      .addOptions(
+        chunk.map(ch =>
+          new StringSelectMenuOptionBuilder()
+            .setLabel(ch.label.slice(0, 100))
+            .setValue(ch.url)
+            .setDescription(`الفصل ${ch.number}`)
+        )
+      );
+
+    rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
+  }
+
+  const msg = await channel.send({ embeds: [embed], components: rows });
+  return msg.id;
+}
+
+// ─── معالجة Select Menu ───────────────────────────────────────
+
+export async function handleMangaSelectMenu(
+  interaction: StringSelectMenuInteraction,
+  client: Client,
+): Promise<void> {
+  // customId: omg_select:{slug}:{offset}
+  const parts    = interaction.customId.split(':');
+  const slug     = parts[1];
+  const chapterUrl  = interaction.values[0];
+
+  // نجيب label من manga details
+  const manga = await getMangaDetails(slug).catch(() => null);
+  const chapter = manga?.chapters.find(c => c.url === chapterUrl);
+  const label   = chapter?.label ?? `فصل من ${slug}`;
+
+  await startOnlineReading(client, interaction, slug, chapterUrl, label);
+}
+
+export function getOnlineActiveSessions() {
+  return Array.from(onlineSessions.values());
+}

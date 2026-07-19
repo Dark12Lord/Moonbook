@@ -7,6 +7,7 @@ import {
   handleStartReading,
 } from './reader';
 import { handleSlashCommand, registerCommands } from './commands';
+import { handleOnlineReaderButton, handleOnlineGotoModal, handleMangaSelectMenu } from './manga_reader';
 import { logError } from './logger';
 
 export function createDiscordClient(): Client {
@@ -41,26 +42,44 @@ export async function startDiscordBot(client: Client): Promise<void> {
         return;
       }
 
-      // ─── Modal Submit (Go to page) ────────────────────────
+      // ─── Modal Submit ─────────────────────────────────────
       if (interaction.isModalSubmit()) {
         if (interaction.customId.startsWith('moonbook_modal:')) {
           await handleGotoModal(interaction);
+        } else if (interaction.customId.startsWith('omg_modal:')) {
+          await handleOnlineGotoModal(interaction);
+        }
+        return;
+      }
+
+      // ─── Select Menu (اختيار فصل من المانهوا) ─────────────
+      if (interaction.isStringSelectMenu()) {
+        if (interaction.customId.startsWith('omg_select:')) {
+          await handleMangaSelectMenu(interaction, client);
         }
         return;
       }
 
       // ─── Buttons ──────────────────────────────────────────
       if (!interaction.isButton()) return;
-      if (!interaction.customId.startsWith('moonbook_')) return;
 
-      // زر "ابدأ القراءة" في بطاقة الفصل
+      // زر "ابدأ القراءة" في بطاقة الفصل المرفوع
       if (interaction.customId.startsWith('moonbook_start:')) {
         await handleStartReading(interaction);
         return;
       }
 
-      // أزرار القارئ
-      await handleReaderInteraction(interaction);
+      // أزرار قارئ الملفات المرفوعة
+      if (interaction.customId.startsWith('moonbook_')) {
+        await handleReaderInteraction(interaction);
+        return;
+      }
+
+      // أزرار قارئ المانهوا الأونلاين
+      if (interaction.customId.startsWith('omg_')) {
+        await handleOnlineReaderButton(interaction);
+        return;
+      }
 
     } catch (error: any) {
       console.error('[discord] interaction error:', error);

@@ -162,6 +162,7 @@ export function createWebApp(discordClient: Client): Express {
           <div class="card">
             <h1>🌙 Moonbook</h1>
             <p class="muted">ارفع فصل ZIP، استخرجه، قسّم الصور الطويلة، وانشر في Discord.</p>
+            <a href="/library" style="display:inline-block;margin-bottom:18px;padding:9px 16px;background:#7c5cff;color:white;border-radius:10px;text-decoration:none;font-weight:600;font-size:14px;">📚 مكتبة المانهوا (أونلاين)</a>
 
             <form id="uploadForm">
               <label>عنوان الفصل</label>
@@ -360,4 +361,201 @@ export function createWebApp(discordClient: Client): Express {
   });
 
   return app;
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+// Library — بحث ونشر المانهوات من mangalik.net
+// ═══════════════════════════════════════════════════════════════
+
+import { searchManga, getMangaDetails } from './scraper';
+import { publishMangaToChannel } from './manga_reader';
+import { addPublishedManga, listPublishedManga, removePublishedManga } from './library';
+import { TextChannel as DJsTextChannel } from 'discord.js';
+
+// صفحة المكتبة
+export function addLibraryRoutes(app: Express, discordClient: import('discord.js').Client) {
+  // ─── صفحة البحث ─────────────────────────────────────────
+  app.get('/library', async (_req, res) => {
+    const published = await listPublishedManga();
+
+    const rows = published.map(m => `
+      <tr>
+        <td data-label="المانهوا">
+          <div style="display:flex;align-items:center;gap:10px;">
+            ${m.cover ? `<img src="${escapeHtml(m.cover)}" style="width:36px;height:50px;object-fit:cover;border-radius:6px;">` : ''}
+            <span>${escapeHtml(m.title)}</span>
+          </div>
+        </td>
+        <td data-label="الفصول">${m.totalChapters}</td>
+        <td data-label="الحالة">${escapeHtml(m.status)}</td>
+        <td data-label="إجراءات">
+          <form method="post" action="/library/remove/${encodeURIComponent(m.slug)}">
+            <button class="btn-delete" type="submit">حذف</button>
+          </form>
+        </td>
+      </tr>
+    `).join('');
+
+    res.send(`
+      <html>
+      <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width, initial-scale=1"/>
+        <title>المكتبة — Moonbook</title>
+        <style>
+          :root { --bg:#0b0d11; --card:#13161d; --border:#1f2330; --accent:#7c5cff; --text:#e8e8ea; --muted:#7a8094; --ok:#3ddc97; --err:#e03c3c; }
+          * { box-sizing:border-box; margin:0; padding:0; }
+          body { font-family:"Segoe UI",Tahoma,system-ui,sans-serif; background:var(--bg); color:var(--text); padding:20px 16px 60px; }
+          .back { display:inline-flex; align-items:center; gap:6px; color:var(--muted); text-decoration:none; font-size:13px; margin-bottom:20px; }
+          .back:hover { color:var(--text); }
+          .card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:24px; max-width:900px; margin:0 auto; }
+          h1 { font-size:20px; margin-bottom:4px; }
+          p.sub { color:var(--muted); font-size:13px; margin-bottom:20px; }
+          .search-row { display:flex; gap:10px; margin-bottom:20px; }
+          input[type=text] { flex:1; padding:11px 14px; background:#0f1015; border:1px solid var(--border); border-radius:10px; color:var(--text); font-size:14px; }
+          button { padding:11px 16px; border:none; border-radius:10px; cursor:pointer; font-weight:600; font-size:14px; }
+          .btn-search { background:var(--accent); color:white; }
+          .btn-delete { background:var(--err); color:white; padding:8px 12px; }
+          .btn-publish { background:var(--ok); color:#0a0a0a; padding:8px 12px; }
+          table { width:100%; border-collapse:collapse; margin-top:16px; }
+          th,td { border-bottom:1px solid var(--border); padding:10px; text-align:right; vertical-align:middle; }
+          th { font-size:12px; color:var(--muted); }
+          .results { margin-top:16px; display:none; }
+          .result-item { display:flex; align-items:center; gap:12px; padding:12px; border:1px solid var(--border); border-radius:12px; margin-bottom:10px; background:#0f1015; }
+          .result-item img { width:42px; height:58px; object-fit:cover; border-radius:6px; flex-shrink:0; }
+          .result-meta { flex:1; }
+          .result-title { font-weight:600; font-size:14px; }
+          .result-slug { font-size:11px; color:var(--muted); margin-top:2px; }
+          .spinner { display:none; color:var(--muted); font-size:13px; margin-top:10px; }
+        </style>
+      </head>
+      <body>
+        <a href="/" class="back">← لوحة التحكم</a>
+        <div class="card">
+          <h1>📚 مكتبة المانهوا</h1>
+          <p class="sub">ابحث عن مانهوا وانشرها في ديسكورد مع قائمة فصول كاملة</p>
+
+          <div class="search-row">
+            <input type="text" id="searchInput" placeholder="اكتب اسم المانهوا..." />
+            <button class="btn-search" onclick="doSearch()">🔍 بحث</button>
+          </div>
+          <div class="spinner" id="spinner">⏳ جاري البحث...</div>
+          <div class="results" id="results"></div>
+
+          <h2 style="margin:20px 0 8px; font-size:16px;">المانهوات المنشورة</h2>
+          <table>
+            <thead><tr><th>المانهوا</th><th>الفصول</th><th>الحالة</th><th>إجراءات</th></tr></thead>
+            <tbody>${rows || '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:20px;">لا يوجد مانهوات منشورة بعد</td></tr>'}</tbody>
+          </table>
+        </div>
+
+        <script>
+          async function doSearch() {
+            const q = document.getElementById('searchInput').value.trim();
+            if (!q) return;
+            document.getElementById('spinner').style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+
+            const res = await fetch('/library/search?q=' + encodeURIComponent(q));
+            const data = await res.json();
+
+            document.getElementById('spinner').style.display = 'none';
+            const el = document.getElementById('results');
+            el.style.display = 'block';
+
+            if (!data.length) { el.innerHTML = '<p style="color:var(--muted);font-size:13px;">لم يتم العثور على نتائج</p>'; return; }
+
+            el.innerHTML = data.map(m => \`
+              <div class="result-item">
+                \${m.cover ? \`<img src="\${m.cover}" onerror="this.style.display='none'">\` : ''}
+                <div class="result-meta">
+                  <div class="result-title">\${m.title}</div>
+                  <div class="result-slug">\${m.slug}</div>
+                </div>
+                <button class="btn-publish" onclick="publish('\${m.slug}', this)">نشر في ديسكورد</button>
+              </div>
+            \`).join('');
+          }
+
+          async function publish(slug, btn) {
+            btn.disabled = true;
+            btn.textContent = '⏳ جاري النشر...';
+            const res = await fetch('/library/publish', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ slug })
+            });
+            const data = await res.json();
+            if (data.ok) {
+              btn.textContent = '✅ تم النشر';
+              btn.style.background = '#3ddc97';
+              setTimeout(() => location.reload(), 1200);
+            } else {
+              btn.textContent = '❌ فشل';
+              btn.style.background = 'var(--err)';
+              btn.disabled = false;
+              alert(data.error || 'فشل النشر');
+            }
+          }
+
+          document.getElementById('searchInput').addEventListener('keydown', e => {
+            if (e.key === 'Enter') doSearch();
+          });
+        </script>
+      </body>
+      </html>
+    `);
+  });
+
+  // ─── API بحث ────────────────────────────────────────────
+  app.get('/library/search', async (req, res) => {
+    const q = String(req.query.q || '').trim();
+    if (!q) return res.json([]);
+    try {
+      const results = await searchManga(q);
+      res.json(results);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ─── نشر مانهوا ─────────────────────────────────────────
+  app.post('/library/publish', async (req, res) => {
+    const { slug } = req.body;
+    if (!slug) return res.status(400).json({ error: 'slug مطلوب' });
+
+    const guildId   = process.env.DISCORD_GUILD_ID || '';
+    const channelId = process.env.DISCORD_CHANNEL_ID || '';
+
+    try {
+      const manga   = await getMangaDetails(slug);
+      const channel = await discordClient.channels.fetch(channelId) as DJsTextChannel;
+
+      const msgId = await publishMangaToChannel(discordClient, channel, manga);
+
+      await addPublishedManga({
+        slug: manga.slug,
+        title: manga.title,
+        cover: manga.cover,
+        description: manga.description,
+        status: manga.status,
+        totalChapters: manga.chapters.length,
+        guildId,
+        channelId,
+        messageId: msgId,
+        publishedAt: new Date().toISOString(),
+      });
+
+      res.json({ ok: true });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // ─── حذف من المكتبة ──────────────────────────────────────
+  app.post('/library/remove/:slug', async (req, res) => {
+    await removePublishedManga(req.params.slug);
+    res.redirect('/library');
+  });
 }

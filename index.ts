@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs-extra';
 import { ensureBaseDirs, TMP_DIR, CHAPTERS_DIR } from './utils';
 import { createDiscordClient, startDiscordBot } from './discord';
-import { createWebApp } from './web';
+import { createWebApp, addLibraryRoutes } from './web';
 
 dotenv.config();
 
@@ -37,6 +37,7 @@ async function main() {
 
   const discordClient = createDiscordClient();
   const app = createWebApp(discordClient);
+  addLibraryRoutes(app, discordClient);
 
   const port = Number(process.env.PORT || 3000);
   const webBaseUrl = process.env.WEB_BASE_URL || `http://localhost:${port}`;
