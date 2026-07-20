@@ -200,10 +200,10 @@ export async function startOnlineReading(
     onlineUserSession.delete(interaction.user.id);
   }
 
-  await interaction.reply({ content: '⏳ جاري جلب الفصل وإنشاء روم القراءة...', ephemeral: true });
+  await interaction.reply({ content: '⏳ جاري جلب الفصل... قد يستغرق 30 ثانية في أول طلب.', ephemeral: true });
 
   try {
-    // جلب صور الفصل
+    // جلب صور الفصل عبر الـ Proxy
     const { images } = await getChapterPages(chapterUrl);
 
     const guildId = process.env.DISCORD_GUILD_ID || '';
