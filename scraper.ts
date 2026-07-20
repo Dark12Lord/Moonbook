@@ -4,8 +4,9 @@
 
 import { logError } from './logger';
 
-const BASE_URL = 'https://lekmanga.net'; // يتجاوز الـ Captcha على mangalik.net
-const MANGA_BASE = 'https://mangalik.net';  // روابط الفصول تبقى على النطاق الأصلي
+const BASE_URL = 'https://manga-starz.com';  // يفتح بدون Captcha، نفس بنية mangalik.net
+const MANGA_BASE = 'https://manga-starz.net'; // الدومين الأصلي للفصول
+const IMG_BASE   = 'starz.manga-starz.net';   // سيرفر الصور
 const HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
   'Referer': BASE_URL,
@@ -193,8 +194,8 @@ export async function getMangaDetails(slug: string): Promise<MangaDetails> {
 // ─── صور الفصل ────────────────────────────────────────────────
 
 export async function getChapterPages(chapterUrl: string): Promise<ChapterPages> {
-  // روابط الفصول على mangalik.net — نستبدل بـ lekmanga.net لتجاوز الـ Captcha
-  const fetchUrl = chapterUrl.replace('mangalik.net', 'lekmanga.net');
+  // روابط الفصول على manga-starz.net — نستخدم manga-starz.com لتجاوز أي حماية
+  const fetchUrl = chapterUrl.replace('manga-starz.net', 'manga-starz.com');
 
   try {
     const html = await fetchHtml(fetchUrl);
@@ -218,7 +219,7 @@ export async function getChapterPages(chapterUrl: string): Promise<ChapterPages>
       if (!src || !src.startsWith('http')) continue;
 
       // نفلتر فقط صور الفصل الفعلية (على io.mangalik.net أو s*solo.mangalik.net)
-      const isChapterImage = src.includes('io.mangalik.net') || src.includes('mangalik.net/wp-content/uploads');
+      const isChapterImage = src.includes('starz.manga-starz.net') || src.includes('manga-starz.net/wp-content/uploads');
       if (!isChapterImage) continue;
 
       // نستبعد الأيقونات والشعارات والأغلفة الصغيرة
