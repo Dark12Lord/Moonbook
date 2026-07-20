@@ -47,12 +47,18 @@ export interface ChapterPages {
 // ─── helpers ──────────────────────────────────────────────────
 
 async function fetchHtml(url: string): Promise<string> {
+  console.log(`[scraper] Fetching: ${url}`);
   const res = await fetch(url, {
     headers: HEADERS,
     signal: AbortSignal.timeout(15_000),
   });
+  console.log(`[scraper] Response: ${res.status} ${res.statusText} — ${url}`);
   if (!res.ok) throw new Error(`HTTP ${res.status} — ${url}`);
-  return res.text();
+  const html = await res.text();
+  console.log(`[scraper] HTML length: ${html.length} chars`);
+  // نطبع أول 500 حرف عشان نشوف إذا في Captcha أو redirect
+  console.log(`[scraper] HTML preview:\n${html.slice(0, 500)}\n---`);
+  return html;
 }
 
 // Madara theme يضع الصور إما في src أو data-src (lazy loading)
@@ -81,37 +87,30 @@ export async function searchManga(query: string): Promise<MangaSearchResult[]> {
     const html = await fetchHtml(url);
     const results: MangaSearchResult[] = [];
 
-    // بنية Madara الفعلية: كل مانهوا داخل div.c-image-hover + h3.h5
-    // <div class="c-image-hover"><a href="URL"><img src="..." data-src="..."></a></div>
-    // <h3 class="h5"><a href="URL">العنوان</a></h3>
+    console.log(`[scraper:search] Looking for c-image-hover pattern...`);
     const cardRegex = /<div[^>]+class="[^"]*c-image-hover[^"]*"[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>\s*(<img[^>]+>)/g;
     const titleRegex = /<h3[^>]+class="[^"]*h5[^"]*"[^>]*>\s*<a[^>]+href=["']([^"']+)["'][^>]*>([^<]+)<\/a>/g;
 
-    // نجمع العناوين أولاً
     const titlesMap = new Map<string, string>();
     let tMatch: RegExpExecArray | null;
     while ((tMatch = titleRegex.exec(html)) !== null) {
-      const tUrl = tMatch[1].trim();
-      const title = decodeHtmlEntities(tMatch[2].trim());
-      titlesMap.set(tUrl, title);
+      titlesMap.set(tMatch[1].trim(), decodeHtmlEntities(tMatch[2].trim()));
     }
+    console.log(`[scraper:search] Found ${titlesMap.size} titles`);
 
-    // نجمع الصور والروابط
     let cMatch: RegExpExecArray | null;
     while ((cMatch = cardRegex.exec(html)) !== null && results.length < 10) {
       const mangaUrl = cMatch[1].trim();
       const imgTag   = cMatch[2];
-      const cover    = extractImgSrc(imgTag)
-        .replace(/\-\d+x\d+(\.\w+)$/, '$1'); // نزيل الـ resize suffix
-
+      const cover    = extractImgSrc(imgTag).replace(/\-\d+x\d+(\.\w+)$/, '$1');
       const slugMatch = mangaUrl.match(/\/manga\/([^/]+)\/?$/);
       if (!slugMatch) continue;
       const slug  = slugMatch[1];
       const title = titlesMap.get(mangaUrl) || slug;
-
       results.push({ title, slug, cover, url: mangaUrl });
     }
 
+    console.log(`[scraper:search] Final results count: ${results.length}`);
     return results;
   } catch (err: any) {
     await logError({ context: 'searchManga', message: err.message, stack: err.stack });
