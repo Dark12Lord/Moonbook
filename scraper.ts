@@ -51,15 +51,43 @@ async function apiGet<T>(endpoint: string): Promise<T> {
 }
 
 // ─── بحث ──────────────────────────────────────────────────────
+async function rawSearch(query: string): Promise<any[]> {
+  const data = await apiGet<{ manga: any[] }>(
+    `/manga?query=${encodeURIComponent(query)}&limit=10`
+  );
+  return data.manga || [];
+}
+
+// يشيل علامات الترقيم ويبسّط النص عشان يزيد فرصة المطابقة عند الـ API
+function simplifyQuery(query: string): string {
+  return query
+    .replace(/[,.!?:;"'’“”()\[\]]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export async function searchManga(query: string): Promise<MangaSearchResult[]> {
   try {
-    const data = await apiGet<{ manga: any[] }>(
-      `/manga?query=${encodeURIComponent(query)}&limit=10`
-    );
+    let manga = await rawSearch(query);
 
-    console.log('[scraper] raw search response:', JSON.stringify(data).slice(0, 1000));
+    // محاولة 2: نفس الاستعلام لكن بدون علامات الترقيم
+    if (!manga.length) {
+      const simplified = simplifyQuery(query);
+      if (simplified && simplified !== query) {
+        manga = await rawSearch(simplified);
+      }
+    }
 
-    return (data.manga || []).map((m: any) => ({
+    // محاولة 3: أول كلمتين بس من العنوان (مفيد للعناوين الطويلة)
+    if (!manga.length) {
+      const words = simplifyQuery(query).split(' ').filter(Boolean);
+      if (words.length > 2) {
+        const shortQuery = words.slice(0, 2).join(' ');
+        manga = await rawSearch(shortQuery);
+      }
+    }
+
+    return manga.map((m: any) => ({
       title: m.title || m.id,
       slug: m.id,
       cover: m.coverUrl || '',
