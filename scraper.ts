@@ -1,14 +1,14 @@
 // ─── scraper.ts ───────────────────────────────────────────────
-// يتصل بـ moonbook-proxy على HuggingFace Spaces
-// الـ Proxy هو اللي يفتح المواقع بمتصفح حقيقي
+// يستخدم OriginManga Public API — مجاني، بدون مفتاح، بدون Playwright
+// https://originmanga.com/api/public
 
 import { logError } from './logger';
 
-const PROXY_URL = (process.env.PROXY_URL || '').replace(/\/$/, '');
+const API = 'https://originmanga.com/api/public';
 
 export interface MangaSearchResult {
   title: string;
-  slug: string;
+  slug: string;  // نستخدم الـ ID بدل slug هنا
   cover: string;
   url: string;
 }
@@ -28,6 +28,7 @@ export interface ChapterEntry {
   number: string;
   label: string;
   url: string;
+  pages?: string[];  // OriginManga يعطينا الصور مباشرة
 }
 
 export interface ChapterPages {
@@ -35,53 +36,98 @@ export interface ChapterPages {
   images: string[];
 }
 
-async function proxyGet<T>(endpoint: string): Promise<T> {
-  if (!PROXY_URL) throw new Error('PROXY_URL غير محدد في متغيرات البيئة');
-
-  const url = `${PROXY_URL}${endpoint}`;
+async function apiGet<T>(endpoint: string): Promise<T> {
+  const url = `${API}${endpoint}`;
   console.log(`[scraper] → ${url}`);
 
   const res = await fetch(url, {
-    signal: AbortSignal.timeout(60_000), // نعطيه وقت كافي لـ Playwright
+    headers: { 'Accept': 'application/json' },
+    signal: AbortSignal.timeout(20_000),
   });
 
   console.log(`[scraper] ← ${res.status} ${endpoint}`);
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`Proxy error ${res.status}: ${body.slice(0, 200)}`);
-  }
-
+  if (!res.ok) throw new Error(`API error ${res.status}: ${endpoint}`);
   return res.json();
 }
 
+// ─── بحث ──────────────────────────────────────────────────────
 export async function searchManga(query: string): Promise<MangaSearchResult[]> {
   try {
-    const data = await proxyGet<{ results: MangaSearchResult[] }>(
-      `/search?q=${encodeURIComponent(query)}`
+    const data = await apiGet<{ manga: any[] }>(
+      `/manga?query=${encodeURIComponent(query)}&limit=10`
     );
-    return data.results || [];
+
+    return (data.manga || []).map((m: any) => ({
+      title: m.title || m.id,
+      slug: m.id,
+      cover: m.coverUrl || '',
+      url: `https://originmanga.com/manga/${m.id}`,
+    }));
   } catch (err: any) {
     await logError({ context: 'searchManga', message: err.message, stack: err.stack });
     throw new Error(`فشل البحث: ${err.message}`);
   }
 }
 
-export async function getMangaDetails(slug: string): Promise<MangaDetails> {
+// ─── تفاصيل المانهوا + الفصول ─────────────────────────────────
+export async function getMangaDetails(id: string): Promise<MangaDetails> {
   try {
-    return await proxyGet<MangaDetails>(`/manga/${encodeURIComponent(slug)}`);
+    // جلب التفاصيل والفصول بالتوازي
+    const [detailData, chapData] = await Promise.all([
+      apiGet<{ manga: any }>(`/manga/${id}`),
+      apiGet<{ manga: any; chapters: any[] }>(`/manga/${id}/chapters?order=asc`),
+    ]);
+
+    const m = detailData.manga;
+    const chapters: ChapterEntry[] = (chapData.chapters || []).map((ch: any) => ({
+      number: String(ch.chapterNumber),
+      label: ch.title ? `الفصل ${ch.chapterNumber}: ${ch.title}` : `الفصل ${ch.chapterNumber}`,
+      // نخزن mangaId|chapterNumber عشان getChapterPages يعرف يجيب الصور
+      url: `${id}|${ch.chapterNumber}`,
+      pages: ch.pages || [],
+    }));
+
+    return {
+      title: m.title || id,
+      slug: id,
+      cover: m.coverUrl || '',
+      description: m.description || '',
+      status: m.status === 'COMPLETED' ? 'مكتملة' : m.status === 'ONGOING' ? 'مستمرة' : m.status || 'غير معروف',
+      genres: m.genres || [],
+      url: `https://originmanga.com/manga/${id}`,
+      chapters,
+    };
   } catch (err: any) {
     await logError({ context: 'getMangaDetails', message: err.message, stack: err.stack });
-    throw new Error(`فشل جلب تفاصيل المانهوا: ${err.message}`);
+    throw new Error(`فشل جلب المانهوا: ${err.message}`);
   }
 }
 
+// ─── صور الفصل ────────────────────────────────────────────────
+// في OriginManga، الـ pages تأتي مع /manga/{mangaId}/chapters
+// نحفظ chapter ID في url وnجيب صور الفصل من نفس endpoint
 export async function getChapterPages(chapterUrl: string): Promise<ChapterPages> {
   try {
-    const data = await proxyGet<{ label: string; images: string[] }>(
-      `/chapter?url=${encodeURIComponent(chapterUrl)}`
+    // chapterUrl هنا بصيغة "{mangaId}|{chapterNumber}|{chapterTitle}"
+    // أو مجرد الـ pages مخزّنة مسبقاً
+    const parts = chapterUrl.split('|');
+    const mangaId = parts[0];
+    const chapterNum = parts[1];
+
+    const data = await apiGet<{ manga: any; chapters: any[] }>(
+      `/manga/${mangaId}/chapters?order=asc`
     );
-    return { chapterLabel: data.label, images: data.images };
+
+    const ch = data.chapters?.find(
+      (c: any) => String(c.chapterNumber) === String(chapterNum)
+    );
+
+    if (!ch?.pages?.length) throw new Error('لم يتم العثور على صور الفصل');
+
+    return {
+      chapterLabel: ch.title ? `الفصل ${ch.chapterNumber}: ${ch.title}` : `الفصل ${ch.chapterNumber}`,
+      images: ch.pages,
+    };
   } catch (err: any) {
     await logError({ context: 'getChapterPages', message: err.message, stack: err.stack });
     throw new Error(`فشل جلب صور الفصل: ${err.message}`);
