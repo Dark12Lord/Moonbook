@@ -57,6 +57,8 @@ export async function searchManga(query: string): Promise<MangaSearchResult[]> {
       `/manga?query=${encodeURIComponent(query)}&limit=10`
     );
 
+    console.log('[scraper] raw search response:', JSON.stringify(data).slice(0, 1000));
+
     return (data.manga || []).map((m: any) => ({
       title: m.title || m.id,
       slug: m.id,
