@@ -73,26 +73,52 @@ async function cleanupSession(session: OnlineSession) {
   }
 }
 
-// ─── تحميل صورة من رابط ───────────────────────────────────────
+import sharp from 'sharp';
 
-async function downloadImage(url: string, destDir: string): Promise<string> {
-  const ext = path.extname(new URL(url).pathname) || '.jpg';
-  const name = `${crypto.randomUUID()}${ext}`;
-  const dest = path.join(destDir, name);
+const MAX_SLICE_HEIGHT = Number(process.env.MAX_SLICE_HEIGHT || 1800);
+
+// ─── تحميل صورة وقصها لو كانت طويلة ─────────────────────────
+
+async function downloadAndSplitImage(url: string, destDir: string): Promise<string[]> {
+  const ext  = path.extname(new URL(url).pathname) || '.jpg';
+  const base = crypto.randomUUID();
+  const dest = path.join(destDir, `${base}${ext}`);
 
   const res = await fetch(url, {
     headers: {
-      'Referer': 'https://mangalik.net/',
+      'Referer': 'https://olympustaff.com/',
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
     },
     signal: AbortSignal.timeout(20_000),
   });
   if (!res.ok) throw new Error(`فشل تحميل الصورة: HTTP ${res.status}`);
 
-  const buffer = Buffer.from(await res.arrayBuffer());
   await fs.ensureDir(destDir);
-  await fs.writeFile(dest, buffer);
-  return dest;
+  await fs.writeFile(dest, Buffer.from(await res.arrayBuffer()));
+
+  // فحص الارتفاع وقص الصورة لو طويلة
+  const meta = await sharp(dest, { limitInputPixels: false }).metadata();
+  const height = meta.height ?? 0;
+  const width  = meta.width  ?? 0;
+
+  if (!height || height <= MAX_SLICE_HEIGHT) return [dest];
+
+  // نقص الصورة لقطع
+  const slices: string[] = [];
+  const source = sharp(dest, { limitInputPixels: false, sequentialRead: true });
+  let sliceIndex = 1;
+
+  for (let top = 0; top < height; top += MAX_SLICE_HEIGHT) {
+    const sliceHeight = Math.min(MAX_SLICE_HEIGHT, height - top);
+    const slicePath = path.join(destDir, `${base}_${String(sliceIndex).padStart(2, '0')}${ext}`);
+    await source.clone().extract({ left: 0, top, width, height: sliceHeight }).toFile(slicePath);
+    slices.push(slicePath);
+    sliceIndex++;
+  }
+
+  // نحذف الصورة الأصلية الطويلة بعد القص
+  await fs.remove(dest);
+  return slices;
 }
 
 // ─── Buttons القارئ ───────────────────────────────────────────
@@ -162,29 +188,36 @@ async function sendOnlinePage(
   const imageUrl = session.images[session.pageIndex];
   const tmpDir   = path.join(process.cwd(), 'tmp', session.sessionId);
 
-  // نحمّل الصورة الحالية + الجاية مسبقاً
-  const filePath = await downloadImage(imageUrl, tmpDir);
-  session.cachedFiles.push(filePath);
+  // تحميل الصورة وقصها لو كانت طويلة
+  const slices = await downloadAndSplitImage(imageUrl, tmpDir);
+  session.cachedFiles.push(...slices);
 
   // prefetch الصورة التالية في الخلفية
   const nextUrl = session.images[session.pageIndex + 1];
-  if (nextUrl) downloadImage(nextUrl, tmpDir).then(f => session.cachedFiles.push(f)).catch(() => {});
+  if (nextUrl) downloadAndSplitImage(nextUrl, tmpDir)
+    .then(fs => session.cachedFiles.push(...fs))
+    .catch(() => {});
 
-  const imageName = path.basename(filePath);
-  const embed = buildOnlineEmbed(session, imageName);
-  const file  = new AttachmentBuilder(filePath, { name: imageName });
+  // نبني embed بأول قطعة، والباقي كـ attachments إضافية
+  const firstSlice = slices[0];
+  const firstName  = path.basename(firstSlice);
+  const embed = buildOnlineEmbed(session, firstName);
+  const files = slices.map(s => new AttachmentBuilder(s, { name: path.basename(s) }));
+
+  const current = session.pageIndex + 1;
+  const total   = session.images.length;
   const hasPrev = session.currentChapterIndex > 0;
   const hasNext = session.currentChapterIndex < session.chapterUrls.length - 1;
-  const rows  = [
+  const rows = [
     makeOnlineButtons(session.sessionId),
     makeChapterNavButtons(session.sessionId, hasPrev, hasNext),
   ];
 
   if (edit) {
-    await channel.messages.edit(edit.messageId, { embeds: [embed], files: [file], components: rows });
+    await channel.messages.edit(edit.messageId, { embeds: [embed], files, components: rows });
     return edit.messageId;
   } else {
-    const msg = await channel.send({ embeds: [embed], files: [file], components: rows });
+    const msg = await channel.send({ embeds: [embed], files, components: rows });
     return msg.id;
   }
 }
