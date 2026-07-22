@@ -528,24 +528,11 @@ export function addLibraryRoutes(app: Express, discordClient: import('discord.js
     const guildId   = process.env.DISCORD_GUILD_ID || '';
     const channelId = process.env.DISCORD_CHANNEL_ID || '';
 
-    if (!channelId) {
-      console.error('[publish] DISCORD_CHANNEL_ID غير مضبوط في متغيرات البيئة');
-      return res.status(500).json({ error: 'DISCORD_CHANNEL_ID غير مضبوط' });
-    }
-
     try {
       const manga   = await getMangaDetails(slug);
-      console.log(`[publish] جلبت تفاصيل المانهوا: ${manga.title}, غلاف: ${manga.cover || '(فاضي)'}, فصول: ${manga.chapters.length}`);
-
       const channel = await discordClient.channels.fetch(channelId) as DJsTextChannel;
-      if (!channel) {
-        console.error(`[publish] القناة ${channelId} غير موجودة أو البوت ما يقدر يوصلها`);
-        return res.status(500).json({ error: 'القناة غير موجودة، تأكد من DISCORD_CHANNEL_ID وصلاحيات البوت' });
-      }
-      console.log(`[publish] القناة موجودة: ${channel.id}`);
 
       const msgId = await publishMangaToChannel(discordClient, channel, manga);
-      console.log(`[publish] تم إرسال الرسالة: ${msgId}`);
 
       await addPublishedManga({
         slug: manga.slug,
@@ -562,7 +549,6 @@ export function addLibraryRoutes(app: Express, discordClient: import('discord.js
 
       res.json({ ok: true });
     } catch (err: any) {
-      console.error('[publish] فشل النشر:', err);
       res.status(500).json({ error: err.message });
     }
   });

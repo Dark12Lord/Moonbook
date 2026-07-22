@@ -259,7 +259,31 @@ export async function startOnlineReading(
 
   } catch (err: any) {
     await logError({ context: 'startOnlineReading', message: err.message, stack: err.stack });
-    await interaction.editReply(`❌ فشل فتح الفصل: ${err.message}`);
+
+    // نحدد نوع الخطأ ونعطي رسالة واضحة
+    const isCloudflare = err.message?.includes('503') || err.message?.includes('Cloudflare') || err.message?.includes('blocked');
+    const isNotFound   = err.message?.includes('404') || err.message?.includes('No chapter');
+
+    let msg: string;
+    if (isCloudflare) {
+      msg = [
+        '⏳ **الفصل مو متاح حالياً**',
+        '',
+        'الموقع يحتاج وقت قليل، جرّب مرة ثانية بعد **دقيقتين أو ثلاث**.',
+      ].join('\n');
+    } else if (isNotFound) {
+      msg = '❌ **ما تم العثور على صور الفصل** — ممكن الفصل مو مترجم بعد.';
+    } else {
+      msg = [
+        '❌ **فشل تحميل الفصل**',
+        '',
+        `\`${err.message?.slice(0, 100)}\``,
+        '',
+        'جرّب مرة ثانية بعد قليل.',
+      ].join('\n');
+    }
+
+    await interaction.editReply(msg);
   }
 }
 
@@ -361,11 +385,8 @@ export async function publishMangaToChannel(
         `> 📊 **${manga.chapters.length} فصل** • ${manga.status}`,
         manga.genres.length ? `> 🏷️ ${manga.genres.slice(0, 4).join(' • ')}` : '',
       ].filter(Boolean).join('\n')
-    );
-  if (manga.cover) {
-    embed.setThumbnail(manga.cover);
-  }
-  embed
+    )
+    .setThumbnail(manga.cover)
     .setColor(0x7c5cff)
     .setFooter({ text: `Moonbook • ${manga.slug}` })
     .setTimestamp();
@@ -373,23 +394,8 @@ export async function publishMangaToChannel(
   // ─── Select Menus (كل 25 فصل = منيو) ────────────────────
   const rows: ActionRowBuilder<StringSelectMenuBuilder>[] = [];
 
-  // إزالة أي فصول بنفس القيمة (value) المكررة — تسبب رفض ديسكورد للطلب بخطأ 500
-  const seenValues = new Set<string>();
-  const uniqueChapters = manga.chapters.filter(ch => {
-    if (seenValues.has(ch.url)) {
-      console.warn(`[publish] تجاهلت فصل مكرر: ${ch.url} (${ch.label})`);
-      return false;
-    }
-    seenValues.add(ch.url);
-    return true;
-  });
-
-  if (uniqueChapters.length !== manga.chapters.length) {
-    console.warn(`[publish] عدد الفصول قبل التنظيف: ${manga.chapters.length}, بعد إزالة المكرر: ${uniqueChapters.length}`);
-  }
-
-  for (let i = 0; i < uniqueChapters.length && rows.length < 5; i += CHUNK_SIZE) {
-    const chunk = uniqueChapters.slice(i, i + CHUNK_SIZE);
+  for (let i = 0; i < manga.chapters.length && rows.length < 5; i += CHUNK_SIZE) {
+    const chunk = manga.chapters.slice(i, i + CHUNK_SIZE);
     const first = chunk[0].number;
     const last  = chunk[chunk.length - 1].number;
 
@@ -407,8 +413,6 @@ export async function publishMangaToChannel(
 
     rows.push(new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu));
   }
-
-  console.log('[publish] عدد الـ rows:', rows.length, '| embed length:', JSON.stringify(embed.toJSON()).length);
 
   const msg = await channel.send({ embeds: [embed], components: rows });
   return msg.id;
