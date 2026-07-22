@@ -41,14 +41,14 @@ interface OnlineSession {
   roomChannelId: string;
   messageId?: string;
   pageIndex: number;
-  images: string[];
-  cachedFiles: string[];
+  images: string[];      // مسارات ملفات محلية بعد التحميل والقص
+  cachedFiles: string[]; // للتنظيف عند الإغلاق
   userId: string;
   username: string;
   openedAt: number;
   // التنقل بين الفصول
-  chapterUrls: string[];       // قائمة روابط الفصول المجانية بالترتيب
-  currentChapterIndex: number; // موقع الفصل الحالي
+  chapterUrls: string[];
+  currentChapterIndex: number;
 }
 
 const onlineSessions = new Map<string, OnlineSession>();
@@ -178,34 +178,31 @@ function buildOnlineEmbed(
     .setFooter({ text: `Moonbook • ${session.slug}` });
 }
 
-// ─── إرسال/تعديل صفحة ────────────────────────────────────────
+// ─── تحميل وقص كل صور الفصل ──────────────────────────────────
+
+async function downloadChapter(imageUrls: string[], sessionId: string): Promise<string[]> {
+  const tmpDir = path.join(process.cwd(), 'tmp', sessionId);
+  await fs.ensureDir(tmpDir);
+
+  const allSlices: string[] = [];
+  for (let i = 0; i < imageUrls.length; i++) {
+    const slices = await downloadAndSplitImage(imageUrls[i], tmpDir);
+    allSlices.push(...slices);
+  }
+  return allSlices;
+}
 
 async function sendOnlinePage(
   channel: TextChannel,
   session: OnlineSession,
   edit?: { messageId: string },
 ): Promise<string> {
-  const imageUrl = session.images[session.pageIndex];
-  const tmpDir   = path.join(process.cwd(), 'tmp', session.sessionId);
+  const filePath = session.images[session.pageIndex];
+  const fileName = path.basename(filePath);
 
-  // تحميل الصورة وقصها لو كانت طويلة
-  const slices = await downloadAndSplitImage(imageUrl, tmpDir);
-  session.cachedFiles.push(...slices);
+  const embed = buildOnlineEmbed(session, fileName);
+  const file  = new AttachmentBuilder(filePath, { name: fileName });
 
-  // prefetch الصورة التالية في الخلفية
-  const nextUrl = session.images[session.pageIndex + 1];
-  if (nextUrl) downloadAndSplitImage(nextUrl, tmpDir)
-    .then(fs => session.cachedFiles.push(...fs))
-    .catch(() => {});
-
-  // نبني embed بأول قطعة، والباقي كـ attachments إضافية
-  const firstSlice = slices[0];
-  const firstName  = path.basename(firstSlice);
-  const embed = buildOnlineEmbed(session, firstName);
-  const files = slices.map(s => new AttachmentBuilder(s, { name: path.basename(s) }));
-
-  const current = session.pageIndex + 1;
-  const total   = session.images.length;
   const hasPrev = session.currentChapterIndex > 0;
   const hasNext = session.currentChapterIndex < session.chapterUrls.length - 1;
   const rows = [
@@ -214,10 +211,10 @@ async function sendOnlinePage(
   ];
 
   if (edit) {
-    await channel.messages.edit(edit.messageId, { embeds: [embed], files, components: rows });
+    await channel.messages.edit(edit.messageId, { embeds: [embed], files: [file], components: rows });
     return edit.messageId;
   } else {
-    const msg = await channel.send({ embeds: [embed], files, components: rows });
+    const msg = await channel.send({ embeds: [embed], files: [file], components: rows });
     return msg.id;
   }
 }
@@ -252,11 +249,13 @@ export async function startOnlineReading(
     onlineUserSession.delete(interaction.user.id);
   }
 
-  await interaction.reply({ content: '⏳ جاري جلب الفصل... قد يستغرق 30 ثانية في أول طلب.', ephemeral: true });
+  await interaction.reply({ content: '⏳ جاري تحميل الفصل وتجهيز الصفحات...', ephemeral: true });
 
   try {
-    // جلب صور الفصل عبر الـ Proxy
-    const { images } = await getChapterPages(chapterUrl);
+    // جلب روابط الصور ثم تحميلها وقصها كلها مرة واحدة
+    const { images: imageUrls, chapterLabel: fetchedLabel } = await getChapterPages(chapterUrl);
+    const sessionId = crypto.randomUUID();
+    const slicedImages = await downloadChapter(imageUrls, sessionId);
 
     const guildId = process.env.DISCORD_GUILD_ID || '';
     const room = await createReadingRoom(
@@ -266,18 +265,17 @@ export async function startOnlineReading(
       slug,
     );
 
-    const sessionId = crypto.randomUUID();
     const chapterUrls = allChapterUrls ?? [chapterUrl];
     const currentChapterIndex = chapterUrls.indexOf(chapterUrl);
     const session: OnlineSession = {
       sessionId,
       slug,
       chapterUrl,
-      chapterLabel,
+      chapterLabel: fetchedLabel || chapterLabel,
       roomChannelId: room.id,
       pageIndex: 0,
-      images,
-      cachedFiles: [],
+      images: slicedImages,
+      cachedFiles: slicedImages,
       userId: interaction.user.id,
       username: interaction.user.username,
       openedAt: Date.now(),
@@ -292,7 +290,7 @@ export async function startOnlineReading(
     const welcomeEmbed = new EmbedBuilder()
       .setTitle(`📖 ${chapterLabel}`)
       .setDescription(
-        [`أهلاً <@${interaction.user.id}>! 👋`, '', `> 🖼️ **${images.length} صفحة**`, '', 'استخدم الأزرار للتنقل • ✕ للإغلاق'].join('\n')
+        [`أهلاً <@${interaction.user.id}>! 👋`, '', `> 🖼️ **${slicedImages.length} صفحة**`, '', 'استخدم الأزرار للتنقل • ✕ للإغلاق'].join('\n')
       )
       .setColor(0x7c5cff);
     await room.send({ embeds: [welcomeEmbed] });
@@ -372,19 +370,20 @@ export async function handleOnlineReaderButton(interaction: ButtonInteraction): 
 
     await interaction.deferUpdate();
     const newUrl = session.chapterUrls[newIndex];
-    const newLabel = `فصل من ${session.slug} (${newIndex + 1}/${session.chapterUrls.length})`;
 
     try {
-      const { images, chapterLabel: fetchedLabel } = await getChapterPages(newUrl);
-      // مسح الكاش القديم
+      const { images: imageUrls, chapterLabel: fetchedLabel } = await getChapterPages(newUrl);
+      // مسح ملفات الفصل القديم
       for (const f of session.cachedFiles) await fs.remove(f).catch(() => {});
 
+      const slicedImages = await downloadChapter(imageUrls, session.sessionId);
+
       session.chapterUrl = newUrl;
-      session.chapterLabel = fetchedLabel || newLabel;
+      session.chapterLabel = fetchedLabel || `فصل ${newIndex + 1}`;
       session.currentChapterIndex = newIndex;
       session.pageIndex = 0;
-      session.images = images;
-      session.cachedFiles = [];
+      session.images = slicedImages;
+      session.cachedFiles = slicedImages;
       onlineSessions.set(sessionId, session);
 
       await sendOnlinePage(channel, session, { messageId: interaction.message.id });
