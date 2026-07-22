@@ -147,21 +147,42 @@ export async function getMangaDetails(slug: string): Promise<MangaDetails> {
       genreMatches.map(g => decodeURIComponent(g.replace('genre=', '')))
     )].slice(0, 6);
 
-    // ─── الفصول ───────────────────────────────────────────────
-    // الفصول المجانية: href="/series/SLUG/رقم" أو href="https://olympustaff.com/series/SLUG/رقم"
-    // الفصول المدفوعة: href="#"
-    const chapterRegex = new RegExp(
-      `href="(?:${BASE})?/series/${slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/(\\d+)"`,
-      'g'
-    );
+    // ─── الفصول: نسحب كل الصفحات ─────────────────────────────
+    // نكتشف عدد الصفحات من الـ pagination أولاً
+    const lastPageMatch = html.match(/page=(\d+)[^"]*"[^>]*>\s*(?:›|»|التالي|Next|\d+)\s*<\/a>\s*<\/li>\s*<\/ul>/);
+    const maxPageFromNext = html.match(/page=(\d+)" rel="next"/);
+    // نجيب أعلى رقم صفحة من روابط الـ pagination
+    const allPageNums = [...html.matchAll(/[?&]page=(\d+)/g)].map(m => parseInt(m[1]));
+    const totalPages = allPageNums.length ? Math.max(...allPageNums) + 1 : 1;
 
-    const chapterNums: number[] = [];
-    let cm: RegExpExecArray | null;
-    while ((cm = chapterRegex.exec(html)) !== null) {
-      chapterNums.push(parseInt(cm[1]));
+    console.log(`[scraper] إجمالي الصفحات: ${totalPages}`);
+
+    // دالة مساعدة تسحب أرقام الفصول المجانية من HTML صفحة واحدة
+    const slugEscaped = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    function extractChapNums(pageHtml: string): number[] {
+      const re = new RegExp(`href="(?:${BASE})?/series/${slugEscaped}/(\\d+)"`, 'g');
+      const nums: number[] = [];
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(pageHtml)) !== null) nums.push(parseInt(m[1]));
+      return nums;
     }
 
-    const uniqueNums = [...new Set(chapterNums)].sort((a, b) => a - b);
+    // نجمع الفصول من الصفحة الأولى (مسبوقاً) + باقي الصفحات بالتوازي
+    const allNums: number[] = extractChapNums(html);
+
+    if (totalPages > 1) {
+      const pageUrls = Array.from({ length: totalPages - 1 }, (_, i) =>
+        `${BASE}/series/${slug}?page=${i + 2}`
+      );
+      // نسحب بالتوازي (max 5 في نفس الوقت)
+      for (let i = 0; i < pageUrls.length; i += 5) {
+        const batch = pageUrls.slice(i, i + 5);
+        const pages = await Promise.all(batch.map(u => fetchHtml(u)));
+        pages.forEach(p => allNums.push(...extractChapNums(p)));
+      }
+    }
+
+    const uniqueNums = [...new Set(allNums)].sort((a, b) => a - b);
     const chapters: ChapterEntry[] = uniqueNums.map(num => ({
       number: String(num),
       label: `الفصل ${num}`,

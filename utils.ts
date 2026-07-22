@@ -15,13 +15,17 @@ export interface ReaderSession {
   sessionId: string;
   chapterId: string;
   channelId: string;
-  roomChannelId?: string;    // ID روم القراءة المؤقت
+  roomChannelId?: string;
   messageId?: string;
   title: string;
   pageIndex: number;
-  userId: string;            // من فتح الجلسة
-  username: string;          // اسمه للوق
-  openedAt: number;          // timestamp للـ TTL
+  userId: string;
+  username: string;
+  openedAt: number;
+  // معلومات التنقل بين الفصول (من olympustaff)
+  mangaSlug?: string;
+  chapterUrls?: string[];       // قائمة روابط الفصول بالترتيب
+  currentChapterIndex?: number; // موقع الفصل الحالي في القائمة
 }
 
 export const ROOT_DIR = process.cwd();

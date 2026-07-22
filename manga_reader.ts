@@ -41,11 +41,14 @@ interface OnlineSession {
   roomChannelId: string;
   messageId?: string;
   pageIndex: number;
-  images: string[];        // روابط الصور من mangalik
-  cachedFiles: string[];   // ملفات محملة مؤقتاً على القرص
+  images: string[];
+  cachedFiles: string[];
   userId: string;
   username: string;
   openedAt: number;
+  // التنقل بين الفصول
+  chapterUrls: string[];       // قائمة روابط الفصول المجانية بالترتيب
+  currentChapterIndex: number; // موقع الفصل الحالي
 }
 
 const onlineSessions = new Map<string, OnlineSession>();
@@ -114,8 +117,18 @@ function makeOnlineButtons(sessionId: string): ActionRowBuilder<ButtonBuilder> {
   );
 }
 
-function makeCloseButton(sessionId: string): ActionRowBuilder<ButtonBuilder> {
+function makeChapterNavButtons(sessionId: string, hasPrev: boolean, hasNext: boolean): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`omg_prev_ch:${sessionId}`)
+      .setLabel('◀ الفصل السابق')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(!hasPrev),
+    new ButtonBuilder()
+      .setCustomId(`omg_next_ch:${sessionId}`)
+      .setLabel('الفصل التالي ▶')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!hasNext),
     new ButtonBuilder()
       .setCustomId(`omg_close:${sessionId}`)
       .setLabel('✕ أغلق الروم')
@@ -160,7 +173,12 @@ async function sendOnlinePage(
   const imageName = path.basename(filePath);
   const embed = buildOnlineEmbed(session, imageName);
   const file  = new AttachmentBuilder(filePath, { name: imageName });
-  const rows  = [makeOnlineButtons(session.sessionId), makeCloseButton(session.sessionId)];
+  const hasPrev = session.currentChapterIndex > 0;
+  const hasNext = session.currentChapterIndex < session.chapterUrls.length - 1;
+  const rows  = [
+    makeOnlineButtons(session.sessionId),
+    makeChapterNavButtons(session.sessionId, hasPrev, hasNext),
+  ];
 
   if (edit) {
     await channel.messages.edit(edit.messageId, { embeds: [embed], files: [file], components: rows });
@@ -179,6 +197,7 @@ export async function startOnlineReading(
   slug: string,
   chapterUrl: string,
   chapterLabel: string,
+  allChapterUrls?: string[],
 ): Promise<void> {
   // منع روم مكرر
   const existingId = onlineUserSession.get(interaction.user.id);
@@ -215,6 +234,8 @@ export async function startOnlineReading(
     );
 
     const sessionId = crypto.randomUUID();
+    const chapterUrls = allChapterUrls ?? [chapterUrl];
+    const currentChapterIndex = chapterUrls.indexOf(chapterUrl);
     const session: OnlineSession = {
       sessionId,
       slug,
@@ -227,6 +248,8 @@ export async function startOnlineReading(
       userId: interaction.user.id,
       username: interaction.user.username,
       openedAt: Date.now(),
+      chapterUrls,
+      currentChapterIndex: currentChapterIndex >= 0 ? currentChapterIndex : 0,
     };
 
     onlineSessions.set(sessionId, session);
@@ -300,6 +323,41 @@ export async function handleOnlineReaderButton(interaction: ButtonInteraction): 
       .setRequired(true);
     modal.addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input));
     await interaction.showModal(modal);
+    return;
+  }
+
+  // ─── التنقل بين الفصول ────────────────────────────────────
+  if (action === 'omg_next_ch' || action === 'omg_prev_ch') {
+    const newIndex = action === 'omg_next_ch'
+      ? session.currentChapterIndex + 1
+      : session.currentChapterIndex - 1;
+
+    if (newIndex < 0 || newIndex >= session.chapterUrls.length) {
+      await interaction.reply({ content: '❌ لا يوجد فصل في هذا الاتجاه.', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferUpdate();
+    const newUrl = session.chapterUrls[newIndex];
+    const newLabel = `فصل من ${session.slug} (${newIndex + 1}/${session.chapterUrls.length})`;
+
+    try {
+      const { images, chapterLabel: fetchedLabel } = await getChapterPages(newUrl);
+      // مسح الكاش القديم
+      for (const f of session.cachedFiles) await fs.remove(f).catch(() => {});
+
+      session.chapterUrl = newUrl;
+      session.chapterLabel = fetchedLabel || newLabel;
+      session.currentChapterIndex = newIndex;
+      session.pageIndex = 0;
+      session.images = images;
+      session.cachedFiles = [];
+      onlineSessions.set(sessionId, session);
+
+      await sendOnlinePage(channel, session, { messageId: interaction.message.id });
+    } catch (err: any) {
+      await logError({ context: 'omg_next_ch', message: err.message, stack: err.stack });
+    }
     return;
   }
 
@@ -421,16 +479,18 @@ export async function handleMangaSelectMenu(
   client: Client,
 ): Promise<void> {
   // customId: omg_select:{slug}:{offset}
-  const parts    = interaction.customId.split(':');
-  const slug     = parts[1];
-  const chapterUrl  = interaction.values[0];
+  const parts      = interaction.customId.split(':');
+  const slug       = parts[1];
+  const chapterUrl = interaction.values[0];
 
-  // نجيب label من manga details
   const manga = await getMangaDetails(slug).catch(() => null);
   const chapter = manga?.chapters.find(c => c.url === chapterUrl);
   const label   = chapter?.label ?? `فصل من ${slug}`;
 
-  await startOnlineReading(client, interaction, slug, chapterUrl, label);
+  // نمرر قائمة روابط الفصول كاملة عشان يشتغل زر الفصل التالي/السابق
+  const allChapterUrls = manga?.chapters.map(c => c.url) ?? [chapterUrl];
+
+  await startOnlineReading(client, interaction, slug, chapterUrl, label, allChapterUrls);
 }
 
 export function getOnlineActiveSessions() {
